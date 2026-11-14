@@ -1,0 +1,3 @@
+# Checkpoints directory
+# Weights files (*.pth) are ignored by git due to size limits (>100MB).
+# Place your best_hierarchical_model.pth here.
