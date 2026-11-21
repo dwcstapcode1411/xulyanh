@@ -36,7 +36,6 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-from torchvision import transforms
 import gradio as gr
 
 from taxonomy import (
@@ -108,11 +107,19 @@ if os.path.isfile(checkpoint_path):
 else:
     print(f"Cảnh báo: Chưa tìm thấy checkpoint tại {checkpoint_path}, chạy với trọng số ngẫu nhiên.")
 
-effective_transforms = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+def effective_transforms(image_pil):
+    """
+    Tiền xử lý ảnh thuần PIL + PyTorch (không phụ thuộc torchvision C++ operator)
+    Resize -> ToTensor -> Normalize(ImageNet mean & std).
+    """
+    if image_pil.mode != 'RGB':
+        image_pil = image_pil.convert('RGB')
+    resized = image_pil.resize((224, 224), Image.BILINEAR)
+    arr = np.array(resized, dtype=np.float32) / 255.0
+    tensor = torch.from_numpy(arr).permute(2, 0, 1)
+    mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+    return (tensor - mean) / std
 
 def enable_dropout(m):
     """Bật chế độ huấn luyện ảo chỉ cho tầng Dropout để tính toán Monte Carlo Dropout"""
