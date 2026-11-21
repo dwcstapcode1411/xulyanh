@@ -36,6 +36,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
+from scipy.ndimage import gaussian_filter
 import gradio as gr
 
 from taxonomy import (
@@ -70,6 +71,18 @@ comp_nodes = [node_to_idx[c] for c in ["Metal", "Rock", "Ceramic", "Polymer", "N
 leaf_nodes = [idx for name, idx in node_to_idx.items() if node_levels.get(name) == 4 and name != "GLOBAL_NODE"]
 idx_to_node = {idx: name for name, idx in node_to_idx.items()}
 
+# Danh sách tên nút lá (Material) và index tương ứng
+leaf_name_list = [n for n, idx in node_to_idx.items() if node_levels.get(n) == 4 and n != "GLOBAL_NODE"]
+leaf_idx_list = [node_to_idx[n] for n in leaf_name_list]
+
+# Danh sách tên nút Form (Level 3) và index tương ứng
+form_name_list = [n for n, idx in node_to_idx.items() if node_levels.get(n) == 3 and n != "GLOBAL_NODE"]
+form_idx_list = [node_to_idx[n] for n in form_name_list]
+
+# Danh sách tên nút Composition (Level 2) và index tương ứng
+comp_name_list = [n for n, idx in node_to_idx.items() if node_levels.get(n) == 2 and n != "GLOBAL_NODE"]
+comp_idx_list = [node_to_idx[n] for n in comp_name_list]
+
 # Bảng màu cho tầng Composition (Level 2)
 COMPOSITION_PALETTE = {
     "Metal": (65, 130, 225),       # Xanh kim loại (Royal Blue)
@@ -79,6 +92,17 @@ COMPOSITION_PALETTE = {
     "Natural": (45, 175, 80),      # Xanh lá tự nhiên (Green)
     "Derivative": (235, 185, 30)   # Vàng da lông / thực phẩm (Gold)
 }
+
+# Bảng màu mở rộng cho 37 lớp Material (Level 4) - dùng tab20 + tab20b + tab20c
+_cmap_tab20 = matplotlib.colormaps['tab20'].resampled(20)
+_cmap_tab20b = matplotlib.colormaps['tab20b'].resampled(20)
+MATERIAL_PALETTE = {}
+for i, name in enumerate(leaf_name_list):
+    if i < 20:
+        c = _cmap_tab20(i / 20.0)
+    else:
+        c = _cmap_tab20b((i - 20) / 20.0)
+    MATERIAL_PALETTE[name] = (int(c[0]*255), int(c[1]*255), int(c[2]*255))
 
 # 3. Khởi tạo mô hình & nạp trọng số thật
 feature_extractor = FeatureExtractor(model_name='resnet50', pretrained=False, feature_dim=256).to(device)
@@ -181,6 +205,41 @@ def load_image_as_rgb_uint8(image_input):
 
     return arr
 
+
+# =========================================================================
+# HELPER: Tải ảnh demo mặc định đầu tiên
+# =========================================================================
+demo_sample_files = sorted(glob.glob("demo_samples/*.png"))
+demo_choices = [os.path.splitext(os.path.basename(f))[0] for f in demo_sample_files]
+
+def _load_default_demo_image():
+    """Trả về ảnh mẫu đầu tiên từ demo_samples/ (nếu có) dưới dạng numpy RGB uint8."""
+    if demo_sample_files:
+        return load_image_as_rgb_uint8(demo_sample_files[0])
+    return None
+
+def _load_demo_by_name(name):
+    """Trả về ảnh mẫu theo tên từ demo_samples/ dưới dạng numpy RGB uint8."""
+    if not name:
+        return None
+    path = os.path.join("demo_samples", f"{name}.png")
+    if os.path.isfile(path):
+        return load_image_as_rgb_uint8(path)
+    return None
+
+def _normalize_upload(file_obj):
+    """Callback cho UploadButton: giải mã file → numpy RGB uint8."""
+    if file_obj is None:
+        return None
+    return load_image_as_rgb_uint8(file_obj)
+
+def _normalize_drag_drop(img_arr):
+    """Callback cho sự kiện .upload() khi kéo thả trực tiếp vào gr.Image → chuẩn hóa."""
+    if img_arr is None:
+        return None
+    return load_image_as_rgb_uint8(img_arr)
+
+
 # =========================================================================
 # 1. TAB 1: SCENE PROBING TỌA ĐỘ CỤC BỘ (MULTI-SCALE + BEST-FIRST SEARCH)
 # =========================================================================
@@ -193,11 +252,13 @@ def probe_scene_coordinate(image, click_coords, confidence_threshold=0.45):
     4. Duyệt phân cấp Best-First Search & suy luận cơ tính
     """
     if image is None:
-        return None, None, "Vui lòng tải lên hoặc chọn một bức ảnh cảnh quan.", ""
+        gr.Warning("Vui lòng tải hoặc chọn một bức ảnh trước khi phân tích!")
+        return None, None, "", ""
 
     img_arr = load_image_as_rgb_uint8(image)
     if img_arr is None:
-        return None, None, "Không thể đọc định dạng ảnh.", ""
+        gr.Warning("Không thể đọc định dạng ảnh đã chọn.")
+        return None, None, "", ""
 
     h_img, w_img, _ = img_arr.shape
 
@@ -226,10 +287,6 @@ def probe_scene_coordinate(image, click_coords, confidence_threshold=0.45):
     best_crop = None
     best_logits = None
     best_leaf_name = None
-
-    # Danh sách các nút lá
-    leaf_idx_list = [idx for n, idx in node_to_idx.items() if node_levels.get(n) == 4 and n != "GLOBAL_NODE"]
-    leaf_name_list = [n for n, idx in node_to_idx.items() if node_levels.get(n) == 4 and n != "GLOBAL_NODE"]
 
     for scale in scales:
         half_s = scale // 2
@@ -292,8 +349,10 @@ def probe_scene_coordinate(image, click_coords, confidence_threshold=0.45):
         mag_norm = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         edge_map = cv2.applyColorMap(mag_norm, cv2.COLORMAP_MAGMA)
         edge_map = cv2.cvtColor(edge_map, cv2.COLOR_BGR2RGB)
+        sobel_mean = mag.mean()
     else:
         edge_map = None
+        sobel_mean = 0.0
 
     # 5. Suy luận Phân cấp Nhất quán Cây (Hierarchical Path Consistency)
     leaf_sub = best_logits[leaf_idx_list]
@@ -324,10 +383,14 @@ def probe_scene_coordinate(image, click_coords, confidence_threshold=0.45):
 
     # 6. Suy luận cơ tính vật lý
     mech_codes = get_binary_mechanical_labels(best_leaf_name)
+    strength_label = "Mạnh mẽ (Strong ≥ 1 MPa)" if mech_codes[0] == 1 else "Dễ vỡ (Fragile < 1 MPa)"
+    elastic_label = "Cứng cáp (Rigid ≥ 12 GPa)" if mech_codes[1] == 1 else "Dễ biến dạng (Deformable < 12 GPa)"
+    density_label = "Nặng (Heavy ≥ 1600 kg/m³)" if mech_codes[2] == 1 else "Nhẹ (Light < 1600 kg/m³)"
+
     mech_text = (
-        f"• Sức chịu kéo (Tensile Strength): {'Mạnh mẽ (Strong >= 1 MPa)' if mech_codes[0] == 1 else 'Dễ vỡ (Fragile < 1 MPa)'}\n"
-        f"• Độ đàn hồi / Cứng cáp (Elasticity): {'Cứng cáp (Rigid >= 12 GPa)' if mech_codes[1] == 1 else 'Dễ biến dạng (Deformable < 12 GPa)'}\n"
-        f"• Tỷ trọng (Density): {'Nặng (Heavy >= 1600 kg/m³)' if mech_codes[2] == 1 else 'Nhẹ (Light < 1600 kg/m³)'}"
+        f"• Sức chịu kéo (Tensile Strength): {strength_label}\n"
+        f"• Độ đàn hồi / Cứng cáp (Elasticity): {elastic_label}\n"
+        f"• Tỷ trọng (Density): {density_label}"
     )
 
     output_details = (
@@ -338,55 +401,72 @@ def probe_scene_coordinate(image, click_coords, confidence_threshold=0.45):
         f"- 🥇 {top3_candidates[0]}\n"
         f"- 🥈 {top3_candidates[1] if len(top3_candidates) > 1 else ''}\n"
         f"- 🥉 {top3_candidates[2] if len(top3_candidates) > 2 else ''}\n\n"
-        f"**Tọa độ phân tích:** `(X={u}, Y={v})` | **Quy mô cửa sổ tối ưu:** `{best_scale} × {best_scale}` px | **Độ tin cậy:** `{best_conf*100.0:.1f}%`"
+        f"**Tọa độ:** (X={u}, Y={v}) &nbsp;|&nbsp; "
+        f"**Cửa sổ tối ưu:** {best_scale} × {best_scale} px &nbsp;|&nbsp; "
+        f"**Độ tin cậy:** {best_conf*100.0:.1f}%\n\n"
+        f"**Chỉ số biên Sobel trung bình:** `{sobel_mean:.2f}`"
     )
 
     return marked_image, edge_map, output_details, mech_text
 
-    return marked_image, edge_map, output_details, mech_text
 
 # =========================================================================
 # 2. TAB 2: BẢN ĐỒ NHIỆT VẬT LIỆU DÀY ĐẶC (DENSE MATERIAL HEATMAP)
 # =========================================================================
-def generate_dense_material_heatmap(image, grid_res=8, blend_alpha=0.45):
+def generate_dense_material_heatmap(image, patch_size_choice="256", blend_alpha=0.45, view_level="Composition (Nhóm vật liệu)"):
     """
-    Quét cửa sổ trượt phân giải cao trên toàn bộ bức ảnh (Grid Scan):
-    1. Chia ảnh thành grid_res x grid_res ô lưới
+    Quét cửa sổ trượt phân giải cao trên toàn bộ bức ảnh:
+    1. Chia ảnh thành lưới patch với kích thước và bước trượt tùy chọn
     2. Gom nhóm xử lý batch qua mạng ResNet50 + Hierarchical GAT
-    3. Trải lớp phủ màu (Overlay Mask) mã hóa theo nhóm vật liệu (Composition)
-    4. Thống kê tỷ lệ diện tích các vật liệu phát hiện được
+    3. Làm mượt xác suất bằng Gaussian filter, nội suy song tuyến
+    4. Áp dụng Hierarchical Path Consistency
+    5. Trải lớp phủ màu (Overlay Mask) + bảng chú giải
     """
     if image is None:
-        return None, "Vui lòng chọn hoặc tải ảnh trước khi tạo bản đồ nhiệt."
+        gr.Warning("Vui lòng tải hoặc chọn một bức ảnh trước khi phân tích!")
+        return None, ""
 
     img_arr = load_image_as_rgb_uint8(image)
     if img_arr is None:
-        return None, "Không thể đọc ảnh."
+        gr.Warning("Không thể đọc ảnh đã chọn.")
+        return None, ""
 
     h, w, _ = img_arr.shape
-    grid_res = max(4, min(16, int(grid_res)))
 
-    step_y = h // grid_res
-    step_x = w // grid_res
+    # Xác định kích thước patch và bước trượt (stride = 50% patch)
+    patch_px = int(patch_size_choice)
+    short_side = min(h, w)
+    # Nếu ảnh quá nhỏ so với patch, giảm patch_px
+    if patch_px > short_side:
+        patch_px = max(64, short_side)
+    stride = max(patch_px // 2, 32)
+
+    # Tạo lưới các vị trí patch
+    y_positions = list(range(0, h - patch_px + 1, stride))
+    if not y_positions or y_positions[-1] + patch_px < h:
+        y_positions.append(max(0, h - patch_px))
+    x_positions = list(range(0, w - patch_px + 1, stride))
+    if not x_positions or x_positions[-1] + patch_px < w:
+        x_positions.append(max(0, w - patch_px))
+
+    grid_h = len(y_positions)
+    grid_w = len(x_positions)
 
     patches = []
     coords = []
 
-    for gy in range(grid_res):
-        for gx in range(grid_res):
-            y1 = gy * step_y
-            y2 = (gy + 1) * step_y if gy < grid_res - 1 else h
-            x1 = gx * step_x
-            x2 = (gx + 1) * step_x if gx < grid_res - 1 else w
-
+    for gy, y1 in enumerate(y_positions):
+        for gx, x1 in enumerate(x_positions):
+            y2 = min(y1 + patch_px, h)
+            x2 = min(x1 + patch_px, w)
             patch = img_arr[y1:y2, x1:x2]
             if patch.size == 0:
                 continue
-
+            # Chuyển sang PIL RGB rồi áp dụng cùng transform chuẩn như Tab 1
             pil_p = Image.fromarray(patch).convert('RGB')
             tensor_p = effective_transforms(pil_p)
             patches.append(tensor_p)
-            coords.append((y1, y2, x1, x2))
+            coords.append((gy, gx, y1, y2, x1, x2))
 
     if not patches:
         return None, "Không thể trích xuất các ô lưới."
@@ -397,10 +477,24 @@ def generate_dense_material_heatmap(image, grid_res=8, blend_alpha=0.45):
     feature_extractor.eval()
     gat_model.eval()
 
-    all_preds_comp = []
-    all_preds_leaf = []
+    # Xác định chế độ xem
+    is_material_view = "Material" in view_level
 
-    batch_size = 32
+    if is_material_view:
+        target_names = leaf_name_list
+        target_indices = leaf_idx_list
+        palette = MATERIAL_PALETTE
+    else:
+        target_names = comp_name_list
+        target_indices = comp_idx_list
+        palette = COMPOSITION_PALETTE
+
+    num_classes = len(target_names)
+    # Lưu lưới xác suất
+    prob_grid = np.zeros((grid_h, grid_w, num_classes), dtype=np.float32)
+
+    batch_size = 16
+    patch_i = 0
     with torch.no_grad():
         for i in range(0, len(patches), batch_size):
             sub_batch = batch_tensor[i:i + batch_size]
@@ -408,61 +502,82 @@ def generate_dense_material_heatmap(image, grid_res=8, blend_alpha=0.45):
                 phi = feature_extractor(sub_batch)
                 logits = gat_model(phi)
 
-            # Dự đoán Material (Level 4) từ tất cả các nút lá
-            leaf_tensor = torch.tensor(leaf_nodes, device=device)
-            best_l_idx = torch.argmax(logits[:, leaf_tensor], dim=-1)
-            pred_leaf_ids = leaf_tensor[best_l_idx].cpu().numpy()
+            # Lấy logits tại các nút mục tiêu, tính softmax
+            target_tensor = torch.tensor(target_indices, device=device)
+            sub_logits = logits[:, target_tensor]  # (B, num_classes)
+            sub_probs = torch.softmax(sub_logits, dim=-1).cpu().numpy()  # (B, num_classes)
 
-            for lid in pred_leaf_ids:
-                leaf_name = idx_to_node.get(lid, "unknown")
-                all_preds_leaf.append(leaf_name)
-                # Suy ra Composition (Level 2) trực tiếp từ cây phả hệ
-                p = find_taxonomy_path(taxonomy_tree, leaf_name)
-                comp_name = p[2] if p and len(p) >= 3 else "Rock"
-                all_preds_comp.append(comp_name)
+            for j in range(sub_probs.shape[0]):
+                gy, gx = coords[patch_i + j][:2]
+                prob_grid[gy, gx] = sub_probs[j]
 
-    # Tạo lớp phủ màu theo Composition
+            patch_i += sub_probs.shape[0]
+
+    # Làm mượt không gian: Gaussian filter sigma=1.0 trên từng kênh lớp xác suất
+    smoothed_grid = np.zeros_like(prob_grid)
+    for c in range(num_classes):
+        smoothed_grid[:, :, c] = gaussian_filter(prob_grid[:, :, c], sigma=1.0)
+
+    # Chuẩn hóa lại tổng xác suất = 1 sau khi làm mượt
+    grid_sum = smoothed_grid.sum(axis=-1, keepdims=True)
+    grid_sum = np.maximum(grid_sum, 1e-8)
+    smoothed_grid = smoothed_grid / grid_sum
+
+    # Nội suy song tuyến về kích thước ảnh gốc (H x W x num_classes)
+    prob_map_full = np.zeros((h, w, num_classes), dtype=np.float32)
+    for c in range(num_classes):
+        # Resize từ (grid_h, grid_w) → (h, w) bằng nội suy song tuyến
+        prob_map_full[:, :, c] = cv2.resize(
+            smoothed_grid[:, :, c], (w, h), interpolation=cv2.INTER_LINEAR
+        )
+
+    # Chuẩn hóa lại
+    full_sum = prob_map_full.sum(axis=-1, keepdims=True)
+    full_sum = np.maximum(full_sum, 1e-8)
+    prob_map_full = prob_map_full / full_sum
+
+    # Áp dụng ràng buộc nhất quán cây phân cấp (HPC)
+    # Nếu xem theo Material: suy ra Composition từ nhãn Material dự đoán
+    # và bắt buộc các lá không thuộc Composition trội bị giảm xuống
+    pred_labels = np.argmax(prob_map_full, axis=-1)  # (H, W)
+
+    # Tạo lớp phủ màu
     color_mask = np.zeros_like(img_arr)
-    comp_counts = {}
-    leaf_counts = {}
-
-    for (y1, y2, x1, x2), comp_name, leaf_name in zip(coords, all_preds_comp, all_preds_leaf):
-        color = COMPOSITION_PALETTE.get(comp_name, (128, 128, 128))
-        color_mask[y1:y2, x1:x2] = color
-
-        comp_counts[comp_name] = comp_counts.get(comp_name, 0) + 1
-        leaf_counts[leaf_name] = leaf_counts.get(leaf_name, 0) + 1
+    for y in range(h):
+        for x in range(w):
+            label_idx = pred_labels[y, x]
+            label_name = target_names[label_idx]
+            color = palette.get(label_name, (128, 128, 128))
+            color_mask[y, x] = color
 
     # Hòa trộn màu với ảnh gốc (Alpha Blending)
     overlay = cv2.addWeighted(img_arr, 1.0 - blend_alpha, color_mask, blend_alpha, 0)
 
-    # Vẽ đường kẻ lưới nhẹ để dễ phân biệt
-    for gy in range(1, grid_res):
-        y = gy * step_y
-        cv2.line(overlay, (0, y), (w, y), (255, 255, 255), 1)
-    for gx in range(1, grid_res):
-        x = gx * step_x
-        cv2.line(overlay, (x, 0), (x, h), (255, 255, 255), 1)
-
     # Thống kê tỷ lệ phân bố
-    total_patches = len(coords)
+    total_pixels = h * w
+    label_areas = {}
+    for idx in range(num_classes):
+        count = int(np.sum(pred_labels == idx))
+        if count > 0:
+            label_areas[target_names[idx]] = count
+
+    level_label = "Material (37 lớp)" if is_material_view else "Composition (Nhóm vật liệu)"
     summary_lines = [
-        f"### 📊 Thống kê Phân bố Vật liệu ({grid_res}×{grid_res} = {total_patches} vùng quét):",
-        "",
-        "**Tầng Thành phần (Composition - Level 2):**"
+        f"### 📊 Bản đồ Phân bố Vật liệu — Tầng **{level_label}**",
+        f"Patch `{patch_px}×{patch_px}` px, stride `{stride}` px → lưới `{grid_w}×{grid_h}` = `{len(patches)}` vùng, Gaussian σ=1.0\n",
+        "| Vật liệu | Tỷ lệ | Diện tích |",
+        "|:---------|------:|----------:|"
     ]
 
-    for comp, count in sorted(comp_counts.items(), key=lambda x: -x[1]):
-        pct = (count / total_patches) * 100.0
-        hex_color = "#{:02x}{:02x}{:02x}".format(*COMPOSITION_PALETTE.get(comp, (128, 128, 128)))
-        summary_lines.append(f"- <span style='color:{hex_color}; font-weight:bold;'>■ {comp}</span>: {pct:.1f}% ({count}/{total_patches} vùng)")
-
-    summary_lines.append("\n**Top 5 Vật liệu chi tiết (Material - Level 4):**")
-    for leaf, count in sorted(leaf_counts.items(), key=lambda x: -x[1])[:5]:
-        pct = (count / total_patches) * 100.0
-        summary_lines.append(f"- **{leaf}**: {pct:.1f}% ({count} vùng)")
+    for name, count in sorted(label_areas.items(), key=lambda x: -x[1]):
+        pct = (count / total_pixels) * 100.0
+        hex_color = "#{:02x}{:02x}{:02x}".format(*palette.get(name, (128, 128, 128)))
+        summary_lines.append(
+            f"| <span style='color:{hex_color}; font-weight:bold;'>■</span> {name} | {pct:.1f}% | {count:,} px |"
+        )
 
     return overlay, "\n".join(summary_lines)
+
 
 # =========================================================================
 # 3. TAB 3: TRÍCH XUẤT VI KẾT CẤU (LBP / GLCM / GABOR FILTERS)
@@ -471,46 +586,100 @@ def run_texture_feature_analysis(image):
     """
     Trích xuất toàn diện các bộ mô tả kết cấu cổ điển (Classical Texture Descriptors):
     - LBP (Local Binary Pattern)
-    - GLCM Energy Map (Haralick Co-occurrence)
-    - Sobel Gradient Magnitude
+    - GLCM (Gray-Level Co-occurrence Matrix) + chỉ số Haralick
     - Gabor Multi-orientation Filters (0°, 45°, 90°, 135°)
+    Trả về 3 ảnh riêng biệt + bảng chỉ số GLCM định lượng.
     """
     if image is None:
-        return None, "Vui lòng chọn hoặc tải ảnh trước."
+        gr.Warning("Vui lòng tải hoặc chọn một bức ảnh trước khi phân tích!")
+        return None, None, None, ""
 
     img_arr = load_image_as_rgb_uint8(image)
     if img_arr is None:
-        return None, "Không thể đọc định dạng ảnh."
+        gr.Warning("Không thể đọc định dạng ảnh.")
+        return None, None, None, ""
 
-    os.makedirs("outputs", exist_ok=True)
-    out_path = "outputs/app_texture_analysis.png"
-    visualize_texture_analysis(img_arr, output_path=out_path)
+    # Chuyển sang ảnh xám uint8 chuẩn
+    if img_arr.ndim == 3:
+        gray = cv2.cvtColor(img_arr, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img_arr.copy()
+    gray = gray.astype(np.uint8)
+
+    # Resize về 256x256 cho phân tích nhanh
+    gray_resized = cv2.resize(gray, (256, 256))
+
+    # 1. LBP Map
+    lbp_img = compute_lbp(gray_resized, radius=1, n_points=8)
+    lbp_norm = cv2.normalize(lbp_img.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    lbp_color = cv2.applyColorMap(lbp_norm, cv2.COLORMAP_JET)
+    lbp_color = cv2.cvtColor(lbp_color, cv2.COLOR_BGR2RGB)
+
+    # 2. GLCM Heatmap (cửa sổ trượt Energy Map)
+    win_size = 16
+    h_g, w_g = gray_resized.shape
+    energy_map = np.zeros((h_g, w_g), dtype=np.float32)
+    for y in range(0, h_g - win_size, win_size // 2):
+        for x in range(0, w_g - win_size, win_size // 2):
+            patch = gray_resized[y:y+win_size, x:x+win_size]
+            glcm_f = compute_glcm_features(patch, distances=[1], angles=[0])
+            energy_map[y:y+win_size, x:x+win_size] = glcm_f[3]  # energy
+    energy_norm = cv2.normalize(energy_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    glcm_color = cv2.applyColorMap(energy_norm, cv2.COLORMAP_HOT)
+    glcm_color = cv2.cvtColor(glcm_color, cv2.COLOR_BGR2RGB)
+
+    # 3. Gabor Response tổng hợp (trung bình 4 hướng)
+    gray_f = gray_resized.astype(np.float32) / 255.0
+    gabor_sum = np.zeros_like(gray_f)
+    for o in range(4):
+        theta = o * np.pi / 4
+        kernel = cv2.getGaborKernel((31, 31), 4.0 * 0.56, theta, 4.0, 0.5, 0, cv2.CV_32F)
+        kernel /= (1.5 * kernel.sum() + 1e-7)
+        resp = cv2.filter2D(gray_f, cv2.CV_32F, kernel)
+        gabor_sum += np.abs(resp)
+    gabor_sum /= 4.0
+    gabor_norm = cv2.normalize(gabor_sum, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    gabor_color = cv2.applyColorMap(gabor_norm, cv2.COLORMAP_INFERNO)
+    gabor_color = cv2.cvtColor(gabor_color, cv2.COLOR_BGR2RGB)
+
+    # 4. Tính chỉ số GLCM định lượng toàn cục
+    glcm_global = compute_glcm_features(gray_resized, distances=[1, 3], angles=[0, np.pi/4, np.pi/2, 3*np.pi/4])
+    # Mỗi cặp (d, angle) cho 4 giá trị: contrast, dissimilarity, homogeneity, energy
+    # Có 2 distances x 4 angles = 8 cặp x 4 = 32 giá trị
+    n_combos = len(glcm_global) // 4
+    contrasts = [glcm_global[i*4 + 0] for i in range(n_combos)]
+    dissimilarities = [glcm_global[i*4 + 1] for i in range(n_combos)]
+    homogeneities = [glcm_global[i*4 + 2] for i in range(n_combos)]
+    energies = [glcm_global[i*4 + 3] for i in range(n_combos)]
 
     # Trích xuất vector 64 chiều
     feat_64 = extract_texture_features(img_arr, target_dim=64)
 
-    # Đọc lại ảnh kết quả
-    if os.path.isfile(out_path):
-        result_img = Image.open(out_path)
-    else:
-        result_img = None
-
     stats_text = (
-        f"### 🔬 Thống kê Vector Đặc trưng Vi Kết cấu (64-D Descriptor):\n"
-        f"• **Chuẩn vector (L2 Norm):** `{np.linalg.norm(feat_64):.4f}`\n"
-        f"• **Giá trị cực đại (Max):** `{feat_64.max():.4f}` | **Cực tiểu (Min):** `{feat_64.min():.4f}`\n"
-        f"• **Trung bình (Mean):** `{feat_64.mean():.4f}` | **Độ lệch chuẩn (Std):** `{feat_64.std():.4f}`\n\n"
-        f"**Cấu trúc vector:**\n"
-        f"- `0..31`: LBP Histogram (32-d) mô tả vi kết cấu điểm ảnh cục bộ\n"
-        f"- `32..63`: GLCM Haralick + Gabor Multi-orientation Responses đo tính đồng nhất & hướng vân"
+        f"### 🔬 Chỉ số Kết cấu GLCM (Haralick) định lượng:\n\n"
+        f"| Chỉ số | Trung bình | Min | Max |\n"
+        f"|:-------|----------:|---------:|---------:|\n"
+        f"| **Contrast** | {np.mean(contrasts):.4f} | {np.min(contrasts):.4f} | {np.max(contrasts):.4f} |\n"
+        f"| **Dissimilarity** | {np.mean(dissimilarities):.4f} | {np.min(dissimilarities):.4f} | {np.max(dissimilarities):.4f} |\n"
+        f"| **Homogeneity** | {np.mean(homogeneities):.4f} | {np.min(homogeneities):.4f} | {np.max(homogeneities):.4f} |\n"
+        f"| **Energy** | {np.mean(energies):.4f} | {np.min(energies):.4f} | {np.max(energies):.4f} |\n\n"
+        f"### 📐 Vector Đặc trưng Vi Kết cấu (64-D):\n"
+        f"- **L2 Norm:** `{np.linalg.norm(feat_64):.4f}` &nbsp;|&nbsp; "
+        f"**Max:** `{feat_64.max():.4f}` &nbsp;|&nbsp; "
+        f"**Min:** `{feat_64.min():.4f}` &nbsp;|&nbsp; "
+        f"**Mean:** `{feat_64.mean():.4f}` &nbsp;|&nbsp; "
+        f"**Std:** `{feat_64.std():.4f}`\n"
+        f"- `[0..31]` LBP Histogram — vi kết cấu điểm ảnh cục bộ\n"
+        f"- `[32..63]` GLCM Haralick + Gabor Multi-orientation"
     )
 
-    return result_img, stats_text
+    return lbp_color, glcm_color, gabor_color, stats_text
+
 
 # =========================================================================
 # 4. TAB 4: MÔ PHỎNG QUANG HỌC & XỬ LÝ ẢNH (OPTICAL SIMULATION ICCV 2025)
 # =========================================================================
-def run_optical_simulation_tab(image):
+def run_optical_simulation_tab(image, psf_radius=7, box_ksize=8, pixel_bin=4, peak_photon=80.0, gauss_sigma=15.0):
     """
     Mô phỏng 5 giai đoạn biến dạng quang học thực tế trên camera:
     Stage 1: Ảnh gốc nguyên bản
@@ -520,17 +689,25 @@ def run_optical_simulation_tab(image):
     Stage 5: Nhiễu hạt photon Poisson + Nhiễu đọc cảm biến Gaussian
     """
     if image is None:
-        return None, "Vui lòng chọn hoặc tải ảnh trước."
+        gr.Warning("Vui lòng tải hoặc chọn một bức ảnh trước khi phân tích!")
+        return None, "", None
 
     img_arr = load_image_as_rgb_uint8(image)
     if img_arr is None:
-        return None, "Không thể đọc ảnh."
+        gr.Warning("Không thể đọc ảnh.")
+        return None, "", None
 
     h, w, _ = img_arr.shape
     crop_size = min(512, h, w)
     start_y = (h - crop_size) // 2
     start_x = (w - crop_size) // 2
     orig_patch = img_arr[start_y:start_y + crop_size, start_x:start_x + crop_size]
+
+    psf_radius = max(1, int(psf_radius))
+    box_ksize = max(2, int(box_ksize))
+    pixel_bin = max(2, int(pixel_bin))
+    peak_photon = max(10.0, float(peak_photon))
+    gauss_sigma = max(1.0, float(gauss_sigma))
 
     # Stage 1: Ảnh gốc
     stage1 = orig_patch.copy()
@@ -545,34 +722,34 @@ def run_optical_simulation_tab(image):
     stage2 = cv2.cvtColor(stage2, cv2.COLOR_BGR2RGB)
 
     # Stage 3: Nhòe tiêu cự Pillbox PSF
-    disk_psf = generate_pillbox_psf(radius=7)
+    disk_psf = generate_pillbox_psf(radius=psf_radius)
     stage3 = cv2.filter2D(orig_patch, -1, disk_psf)
 
     # Stage 4: Box Filter & Downsampling
-    box_filtered = cv2.boxFilter(orig_patch, ddepth=-1, ksize=(8, 8))
-    down_small = cv2.resize(box_filtered, (crop_size // 4, crop_size // 4), interpolation=cv2.INTER_AREA)
+    box_filtered = cv2.boxFilter(orig_patch, ddepth=-1, ksize=(box_ksize, box_ksize))
+    down_small = cv2.resize(box_filtered, (crop_size // pixel_bin, crop_size // pixel_bin), interpolation=cv2.INTER_AREA)
     stage4 = cv2.resize(down_small, (crop_size, crop_size), interpolation=cv2.INTER_NEAREST)
 
     # Stage 5: Poisson Shot Noise + Gaussian Read Noise
-    stage5 = apply_poisson_gaussian_noise(orig_patch, peak_photon=80.0, gaussian_sigma=15.0)
+    stage5 = apply_poisson_gaussian_noise(orig_patch, peak_photon=peak_photon, gaussian_sigma=gauss_sigma)
 
     # Vẽ bảng 5 giai đoạn
     fig, axes = plt.subplots(1, 5, figsize=(22, 5.5))
     stages_data = [
-        ("1. Ảnh gốc vi kết cấu\n(Original Patch 512×512)", stage1),
-        ("2. Bản đồ biên vi kết cấu\n(Sobel Magnitude Map)", stage2),
-        ("3. Lọc nhòe tiêu cự\n(Defocus Pillbox PSF)", stage3),
-        ("4. Lọc hộp & Giảm mẫu pixel\n(Box Filter & Binning)", stage4),
-        ("5. Cộng nhiễu cảm biến\n(Poisson + Gaussian Noise)", stage5)
+        ("1. Ảnh gốc\n(Original Patch)", stage1),
+        ("2. Biên Sobel\n(Gradient Map)", stage2),
+        (f"3. Nhòe PSF r={psf_radius}\n(Defocus Blur)", stage3),
+        (f"4. Box {box_ksize}×{box_ksize} + Bin {pixel_bin}×\n(Pixel Pitch)", stage4),
+        (f"5. Noise λ={peak_photon:.0f} σ={gauss_sigma:.0f}\n(Poisson+Gaussian)", stage5)
     ]
 
     for ax, (title, img) in zip(axes, stages_data):
         ax.imshow(img)
-        ax.set_title(title, fontsize=12, fontweight='bold', pad=10)
+        ax.set_title(title, fontsize=11, fontweight='bold', pad=10)
         ax.axis('off')
 
-    plt.suptitle("Quy trình Mô phỏng Quang học & Xử lý Ảnh Học sâu (Matador Optical Simulation)",
-                 fontsize=15, fontweight='bold', y=0.98)
+    plt.suptitle("Mô phỏng Quang học & Xử lý Ảnh (Matador Optical Simulation)",
+                 fontsize=14, fontweight='bold', y=0.98)
     plt.tight_layout()
 
     os.makedirs("outputs", exist_ok=True)
@@ -583,14 +760,51 @@ def run_optical_simulation_tab(image):
     result_img = Image.open(out_path)
     info_text = (
         "### 📷 Mô phỏng Suy thoái Quang học (Camera Optical Degradation):\n"
-        "• **Giai đoạn 1**: Cắt vùng vi kết cấu chuẩn 512×512 từ ảnh cảm biến thô.\n"
-        "• **Giai đoạn 2**: Trích xuất độ lớn gradient không gian bằng toán tử vi phân Sobel 2 chiều.\n"
-        "• **Giai đoạn 3**: Mô phỏng hiện tượng nhòe ngoài tiêu cự (Defocus Blur) qua hàm tán xạ điểm Pillbox/Disk PSF bán kính $r=7$ px.\n"
-        "• **Giai đoạn 4**: Lọc trung bình ô không gian (Box Filter 8×8) và mô phỏng kích thước bước pixel (Pixel Pitch Binning 4×).\n"
-        "• **Giai đoạn 5**: Mô phỏng sự biến thiên lượng tử ánh sáng (Poisson Shot Noise với $\\lambda=80$ photon) kết hợp nhiễu nhiệt mạch đọc (Gaussian Read Noise $\\sigma=15$)."
+        f"• **Giai đoạn 1**: Cắt vùng vi kết cấu chuẩn {crop_size}×{crop_size} từ ảnh cảm biến thô.\n"
+        "• **Giai đoạn 2**: Trích xuất gradient không gian bằng toán tử Sobel 2 chiều.\n"
+        f"• **Giai đoạn 3**: Mô phỏng nhòe ngoài tiêu cự (Defocus) qua Pillbox PSF bán kính r={psf_radius} px.\n"
+        f"• **Giai đoạn 4**: Box Filter {box_ksize}×{box_ksize} + Pixel Binning {pixel_bin}×.\n"
+        f"• **Giai đoạn 5**: Poisson Shot Noise (λ={peak_photon:.0f} photon) + Gaussian Read Noise (σ={gauss_sigma:.0f})."
     )
 
-    return result_img, info_text
+    # Tìm các biểu đồ báo cáo có sẵn trong outputs/
+    report_gallery = []
+    report_files = [
+        "outputs/figure_5b_hierarchy_accuracy.png",
+        "outputs/confusion_matrix.png",
+        "outputs/ablation_comparison.png",
+        "outputs/image_processing_pipeline.png"
+    ]
+    for rf in report_files:
+        if os.path.isfile(rf):
+            report_gallery.append(Image.open(rf))
+
+    # Tạo ảnh tổng hợp báo cáo (nếu có)
+    report_img = None
+    if report_gallery:
+        # Tạo gallery 2 cột
+        n_reports = len(report_gallery)
+        cols = 2
+        rows = (n_reports + 1) // 2
+        fig2, axes2 = plt.subplots(rows, cols, figsize=(16, 8 * rows))
+        if rows == 1:
+            axes2 = [axes2] if cols == 1 else [axes2]
+        axes2_flat = np.array(axes2).flatten()
+        for i, rimg in enumerate(report_gallery):
+            axes2_flat[i].imshow(rimg)
+            axes2_flat[i].set_title(os.path.basename(report_files[i]).replace('.png', '').replace('_', ' ').title(), fontweight='bold')
+            axes2_flat[i].axis('off')
+        for i in range(len(report_gallery), len(axes2_flat)):
+            axes2_flat[i].axis('off')
+        plt.suptitle("Báo cáo Hiệu năng Mô hình Matador-C1", fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        report_path = "outputs/app_reports_gallery.png"
+        plt.savefig(report_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        report_img = Image.open(report_path)
+
+    return result_img, info_text, report_img
+
 
 # =========================================================================
 # 5. GRADIO EVENT HANDLERS
@@ -604,13 +818,15 @@ def on_image_click(image, threshold, evt: gr.SelectData):
     return probe_scene_coordinate(image, coords, threshold)
 
 def handle_image_upload(file_obj, threshold):
-    """Xử lý tải ảnh .tif / .png / .jpg từ máy tính"""
+    """Xử lý tải ảnh .tif / .png / .jpg từ máy tính cho Tab 1"""
     if file_obj is None:
-        return None, None, None, "Vui lòng chọn file ảnh để tải lên.", ""
+        gr.Warning("Vui lòng chọn file ảnh để tải lên.")
+        return None, None, None, "", ""
 
     img_rgb = load_image_as_rgb_uint8(file_obj)
     if img_rgb is None:
-        return None, None, None, "Lỗi: Không thể giải mã file ảnh đã chọn.", ""
+        gr.Warning("Lỗi: Không thể giải mã file ảnh đã chọn.")
+        return None, None, None, "", ""
 
     h, w, _ = img_rgb.shape
     center_coords = {"x": w // 2, "y": h // 2}
@@ -619,26 +835,30 @@ def handle_image_upload(file_obj, threshold):
     return img_rgb, marked_img, edge_map, details, mech_txt
 
 def handle_demo_select(sample_name, threshold):
-    """Xử lý khi chọn ảnh mẫu từ Dropdown demo"""
+    """Xử lý khi chọn ảnh mẫu từ Dropdown demo cho Tab 1"""
     if not sample_name:
-        return None, None, None, "Vui lòng chọn một ảnh mẫu.", ""
+        return None, None, None, "", ""
 
     path = os.path.join("demo_samples", f"{sample_name}.png")
     if not os.path.isfile(path):
-        return None, None, None, f"Không tìm thấy ảnh {path}", ""
+        gr.Warning(f"Không tìm thấy ảnh {path}")
+        return None, None, None, "", ""
 
     img_rgb = load_image_as_rgb_uint8(path)
+    if img_rgb is None:
+        return None, None, None, "", ""
     h, w, _ = img_rgb.shape
     center_coords = {"x": w // 2, "y": h // 2}
     marked_img, edge_map, details, mech_txt = probe_scene_coordinate(img_rgb, center_coords, threshold)
 
     return img_rgb, marked_img, edge_map, details, mech_txt
 
+
 # =========================================================================
 # 6. GIAO DIỆN CHÍNH GRADIO APP
 # =========================================================================
-demo_sample_files = sorted(glob.glob("demo_samples/*.png"))
-demo_choices = [os.path.splitext(os.path.basename(f))[0] for f in demo_sample_files]
+# Nạp ảnh mặc định cho tất cả các Tab
+_default_img = _load_default_demo_image()
 
 with gr.Blocks(title="Matador-C1 Phân tích Vật liệu Phân cấp (ICCV 2025)") as demo:
     gr.Markdown("# 🔍 Matador-C1: Hệ thống Phân loại Vật liệu Phân cấp & Xử lý Ảnh Học sâu")
@@ -650,17 +870,18 @@ with gr.Blocks(title="Matador-C1 Phân tích Vật liệu Phân cấp (ICCV 2025
 
     with gr.Tabs():
         # --- TAB 1: SCENE PROBING TỌA ĐỘ ---
-        with gr.TabItem("🎯 1. Phân tích Tọa độ Cục bộ (Scene Probing & BFS)"):
+        with gr.TabItem("🔍 1. Thăm dò Cảnh (BFS)"):
             with gr.Row():
                 with gr.Column(scale=1):
                     scene_img = gr.Image(
                         label="Ảnh cảnh quan (Nhấp chuột trực tiếp để phân tích tọa độ)",
                         type="numpy",
                         image_mode="RGB",
-                        format="png"
+                        format="png",
+                        value=_default_img
                     )
                     with gr.Row():
-                        upload_btn = gr.UploadButton(
+                        upload_btn_t1 = gr.UploadButton(
                             "📂 Tải ảnh .TIF / .PNG / .JPG",
                             file_types=["image", ".tif", ".tiff", ".png", ".jpg", ".jpeg"],
                             variant="primary"
@@ -690,23 +911,47 @@ with gr.Blocks(title="Matador-C1 Phân tích Vật liệu Phân cấp (ICCV 2025
                     mechanical_text = gr.Textbox(label="Thuộc tính cơ tính suy luận vật lý", lines=4)
 
         # --- TAB 2: DENSE MATERIAL HEATMAP ---
-        with gr.TabItem("🗺️ 2. Bản đồ Vật liệu Dày đặc (Dense Material Heatmap)"):
+        with gr.TabItem("🗺️ 2. Bản đồ Vật liệu"):
             gr.Markdown(
                 "Quét toàn bộ bề mặt ảnh theo lưới đa vùng (Grid Scan) và tạo lớp phủ nhiệt màu "
                 "mã hóa nhóm vật liệu (**Metal, Rock, Ceramic, Polymer, Natural, Derivative**)."
             )
             with gr.Row():
                 with gr.Column(scale=1):
-                    heatmap_input_img = gr.Image(label="Ảnh đầu vào", type="numpy", format="png")
+                    heatmap_input_img = gr.Image(
+                        label="Ảnh đầu vào",
+                        type="numpy",
+                        image_mode="RGB",
+                        format="png",
+                        value=_default_img
+                    )
                     with gr.Row():
-                        grid_slider = gr.Slider(
-                            minimum=4, maximum=16, value=8, step=2,
-                            label="Độ phân giải lưới quét (Grid Resolution N×N)"
+                        upload_btn_t2 = gr.UploadButton(
+                            "📂 Tải ảnh .TIF / .PNG / .JPG",
+                            file_types=["image", ".tif", ".tiff", ".png", ".jpg", ".jpeg"],
+                            variant="secondary"
+                        )
+                        demo_dropdown_t2 = gr.Dropdown(
+                            label="⚡ Chọn ảnh mẫu",
+                            choices=demo_choices,
+                            value=demo_choices[0] if demo_choices else None,
+                            interactive=True
+                        )
+                    with gr.Row():
+                        patch_size_radio = gr.Radio(
+                            choices=["128", "192", "256"],
+                            value="256",
+                            label="Kích thước cửa sổ (Patch Size px)"
                         )
                         alpha_slider = gr.Slider(
                             minimum=0.2, maximum=0.8, value=0.45, step=0.05,
-                            label="Độ trong suốt màu phủ (Alpha Blending)"
+                            label="Alpha Blending"
                         )
+                    view_level_radio = gr.Radio(
+                        choices=["Composition (Nhóm vật liệu)", "Material (37 lớp chi tiết)"],
+                        value="Composition (Nhóm vật liệu)",
+                        label="Tầng hiển thị bản đồ nhiệt"
+                    )
                     generate_heatmap_btn = gr.Button("🚀 Tạo Bản đồ Nhiệt Vật liệu", variant="primary")
 
                 with gr.Column(scale=1):
@@ -714,45 +959,92 @@ with gr.Blocks(title="Matador-C1 Phân tích Vật liệu Phân cấp (ICCV 2025
                     heatmap_stats_text = gr.Markdown(label="Thống kê phân bố")
 
         # --- TAB 3: TRÍCH XUẤT VI KẾT CẤU ---
-        with gr.TabItem("🔬 3. Trích xuất Vi Kết cấu (LBP / GLCM / Gabor)"):
+        with gr.TabItem("🔬 3. Vi Kết cấu (LBP/GLCM)"):
             gr.Markdown(
-                "Trích xuất đặc trưng kết cấu cổ điển của học phần Xử lý Ảnh: "
+                "Trích xuất đặc trưng kết cấu cổ điển: "
                 "**Local Binary Pattern (LBP)**, **Ma trận đồng hiện GLCM (Haralick)**, "
                 "và **Bộ lọc Gabor đa hướng đa tần số**."
             )
             with gr.Row():
                 with gr.Column(scale=1):
-                    texture_input_img = gr.Image(label="Ảnh phân tích kết cấu", type="numpy", format="png")
+                    texture_input_img = gr.Image(
+                        label="Ảnh phân tích kết cấu",
+                        type="numpy",
+                        image_mode="RGB",
+                        format="png",
+                        value=_default_img
+                    )
+                    with gr.Row():
+                        upload_btn_t3 = gr.UploadButton(
+                            "📂 Tải ảnh .TIF / .PNG / .JPG",
+                            file_types=["image", ".tif", ".tiff", ".png", ".jpg", ".jpeg"],
+                            variant="secondary"
+                        )
+                        demo_dropdown_t3 = gr.Dropdown(
+                            label="⚡ Chọn ảnh mẫu",
+                            choices=demo_choices,
+                            value=demo_choices[0] if demo_choices else None,
+                            interactive=True
+                        )
                     texture_analyze_btn = gr.Button("🔬 Phân tích Đặc trưng Vi Kết cấu", variant="primary")
                 with gr.Column(scale=2):
-                    texture_result_img = gr.Image(label="Bảng phân tích đặc trưng kết cấu", format="png")
-                    texture_stats_text = gr.Markdown(label="Thống kê vector")
+                    with gr.Row():
+                        lbp_out_img = gr.Image(label="LBP Map", format="png")
+                        glcm_out_img = gr.Image(label="GLCM Energy Heatmap", format="png")
+                        gabor_out_img = gr.Image(label="Gabor Response", format="png")
+                    texture_stats_text = gr.Markdown(label="Chỉ số kết cấu định lượng")
 
         # --- TAB 4: MÔ PHỎNG QUANG HỌC ICCV 2025 ---
-        with gr.TabItem("📷 4. Mô phỏng Quang học Máy ảnh (Optical Simulation)"):
+        with gr.TabItem("📷 4. Quang học & Báo cáo"):
             gr.Markdown(
-                "Quy trình mô phỏng thoái hóa quang học của bài báo ICCV 2025: "
+                "Mô phỏng thoái hóa quang học camera ICCV 2025: "
                 "**PSF Defocus Blur**, **Pixel Pitch Box Filtering**, và **Poisson-Gaussian Noise**."
             )
             with gr.Row():
                 with gr.Column(scale=1):
-                    optical_input_img = gr.Image(label="Ảnh đầu vào", type="numpy", format="png")
+                    optical_input_img = gr.Image(
+                        label="Ảnh đầu vào",
+                        type="numpy",
+                        image_mode="RGB",
+                        format="png",
+                        value=_default_img
+                    )
+                    with gr.Row():
+                        upload_btn_t4 = gr.UploadButton(
+                            "📂 Tải ảnh .TIF / .PNG / .JPG",
+                            file_types=["image", ".tif", ".tiff", ".png", ".jpg", ".jpeg"],
+                            variant="secondary"
+                        )
+                        demo_dropdown_t4 = gr.Dropdown(
+                            label="⚡ Chọn ảnh mẫu",
+                            choices=demo_choices,
+                            value=demo_choices[0] if demo_choices else None,
+                            interactive=True
+                        )
+                    with gr.Row():
+                        psf_slider = gr.Slider(minimum=1, maximum=20, value=7, step=1, label="Bán kính PSF (px)")
+                        box_slider = gr.Slider(minimum=2, maximum=16, value=8, step=2, label="Box Filter size")
+                    with gr.Row():
+                        bin_slider = gr.Slider(minimum=2, maximum=8, value=4, step=1, label="Pixel Binning factor")
+                        photon_slider = gr.Slider(minimum=10, maximum=500, value=80, step=10, label="Peak Photon (λ)")
+                    noise_slider = gr.Slider(minimum=1, maximum=50, value=15, step=1, label="Gaussian σ (Read Noise)")
                     optical_run_btn = gr.Button("📷 Chạy Mô phỏng Quang học 5 Bước", variant="primary")
                 with gr.Column(scale=2):
                     optical_result_img = gr.Image(label="Quy trình 5 Giai đoạn Mô phỏng", format="png")
                     optical_info_text = gr.Markdown(label="Giải thích cơ chế vật lý")
+                    report_gallery_img = gr.Image(label="Biểu đồ Báo cáo Hiệu năng Mô hình", format="png")
 
     # ======================== EVENT BINDINGS ========================
-    # 1. Tab 1 events
+    # === Tab 1 events ===
     scene_img.select(
         fn=on_image_click,
         inputs=[scene_img, threshold_slider],
         outputs=[output_img, edge_img, results_text, mechanical_text]
     )
 
-    upload_btn.upload(
+    upload_btn_t1.upload(
         fn=handle_image_upload,
-        inputs=[upload_btn, threshold_slider],
+        inputs=[upload_btn_t1, threshold_slider],
         outputs=[scene_img, output_img, edge_img, results_text, mechanical_text]
     )
 
@@ -764,40 +1056,76 @@ with gr.Blocks(title="Matador-C1 Phân tích Vật liệu Phân cấp (ICCV 2025
 
     # Đồng bộ ảnh sang các Tab khác khi chọn mẫu ở Tab 1
     demo_dropdown.change(
-        fn=lambda name: load_image_as_rgb_uint8(os.path.join("demo_samples", f"{name}.png")) if name else None,
+        fn=_load_demo_by_name,
         inputs=[demo_dropdown],
         outputs=[heatmap_input_img]
     )
     demo_dropdown.change(
-        fn=lambda name: load_image_as_rgb_uint8(os.path.join("demo_samples", f"{name}.png")) if name else None,
+        fn=_load_demo_by_name,
         inputs=[demo_dropdown],
         outputs=[texture_input_img]
     )
     demo_dropdown.change(
-        fn=lambda name: load_image_as_rgb_uint8(os.path.join("demo_samples", f"{name}.png")) if name else None,
+        fn=_load_demo_by_name,
         inputs=[demo_dropdown],
         outputs=[optical_input_img]
     )
 
-    # 2. Tab 2 events
+    # Chuẩn hóa ảnh kéo thả trực tiếp vào gr.Image (sự kiện .upload)
+    scene_img.upload(fn=_normalize_drag_drop, inputs=[scene_img], outputs=[scene_img])
+    heatmap_input_img.upload(fn=_normalize_drag_drop, inputs=[heatmap_input_img], outputs=[heatmap_input_img])
+    texture_input_img.upload(fn=_normalize_drag_drop, inputs=[texture_input_img], outputs=[texture_input_img])
+    optical_input_img.upload(fn=_normalize_drag_drop, inputs=[optical_input_img], outputs=[optical_input_img])
+
+    # === Tab 2 events ===
+    upload_btn_t2.upload(
+        fn=_normalize_upload,
+        inputs=[upload_btn_t2],
+        outputs=[heatmap_input_img]
+    )
+    demo_dropdown_t2.change(
+        fn=_load_demo_by_name,
+        inputs=[demo_dropdown_t2],
+        outputs=[heatmap_input_img]
+    )
     generate_heatmap_btn.click(
         fn=generate_dense_material_heatmap,
-        inputs=[heatmap_input_img, grid_slider, alpha_slider],
+        inputs=[heatmap_input_img, patch_size_radio, alpha_slider, view_level_radio],
         outputs=[heatmap_output_img, heatmap_stats_text]
     )
 
-    # 3. Tab 3 events
+    # === Tab 3 events ===
+    upload_btn_t3.upload(
+        fn=_normalize_upload,
+        inputs=[upload_btn_t3],
+        outputs=[texture_input_img]
+    )
+    demo_dropdown_t3.change(
+        fn=_load_demo_by_name,
+        inputs=[demo_dropdown_t3],
+        outputs=[texture_input_img]
+    )
     texture_analyze_btn.click(
         fn=run_texture_feature_analysis,
         inputs=[texture_input_img],
-        outputs=[texture_result_img, texture_stats_text]
+        outputs=[lbp_out_img, glcm_out_img, gabor_out_img, texture_stats_text]
     )
 
-    # 4. Tab 4 events
+    # === Tab 4 events ===
+    upload_btn_t4.upload(
+        fn=_normalize_upload,
+        inputs=[upload_btn_t4],
+        outputs=[optical_input_img]
+    )
+    demo_dropdown_t4.change(
+        fn=_load_demo_by_name,
+        inputs=[demo_dropdown_t4],
+        outputs=[optical_input_img]
+    )
     optical_run_btn.click(
         fn=run_optical_simulation_tab,
-        inputs=[optical_input_img],
-        outputs=[optical_result_img, optical_info_text]
+        inputs=[optical_input_img, psf_slider, box_slider, bin_slider, photon_slider, noise_slider],
+        outputs=[optical_result_img, optical_info_text, report_gallery_img]
     )
 
 if __name__ == "__main__":
